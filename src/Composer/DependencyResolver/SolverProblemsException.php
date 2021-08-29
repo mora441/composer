@@ -63,7 +63,7 @@ class SolverProblemsException extends \RuntimeException
             $hints[] = $this->createExtensionHint();
         }
 
-        if ($isCausedByLock && !$isDevExtraction) {
+        if ($isCausedByLock && !$isDevExtraction && !$request->getUpdateAllowTransitiveRootDependencies()) {
             $hints[] = "Use the option --with-all-dependencies (-W) to allow upgrades, downgrades and removals for packages currently locked to specific versions.";
         }
 
@@ -108,7 +108,8 @@ class SolverProblemsException extends \RuntimeException
     {
         foreach ($reasonSets as $reasonSet) {
             foreach ($reasonSet as $rule) {
-                if (0 === strpos($rule->getRequiredPackage(), 'ext-')) {
+                $required = $rule->getRequiredPackage();
+                if (null !== $required && 0 === strpos($required, 'ext-')) {
                     return true;
                 }
             }

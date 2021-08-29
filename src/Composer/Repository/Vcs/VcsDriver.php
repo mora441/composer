@@ -45,7 +45,7 @@ abstract class VcsDriver implements VcsDriverInterface
     protected $httpDownloader;
     /** @var array */
     protected $infoCache = array();
-    /** @var Cache */
+    /** @var ?Cache */
     protected $cache;
 
     /**
@@ -157,6 +157,7 @@ abstract class VcsDriver implements VcsDriverInterface
      * @param string $url The URL of content
      *
      * @return Response
+     * @throws TransportException
      */
     protected function getContents($url)
     {

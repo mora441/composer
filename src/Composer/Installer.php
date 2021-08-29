@@ -24,6 +24,7 @@ use Composer\DependencyResolver\Pool;
 use Composer\DependencyResolver\Request;
 use Composer\DependencyResolver\Solver;
 use Composer\DependencyResolver\SolverProblemsException;
+use Composer\DependencyResolver\PolicyInterface;
 use Composer\Downloader\DownloadManager;
 use Composer\EventDispatcher\EventDispatcher;
 use Composer\Installer\InstallationManager;
@@ -42,6 +43,7 @@ use Composer\Package\Version\VersionParser;
 use Composer\Package\Package;
 use Composer\Repository\ArrayRepository;
 use Composer\Repository\RepositorySet;
+use Composer\Repository\CompositeRepository;
 use Composer\Semver\Constraint\Constraint;
 use Composer\Package\Locker;
 use Composer\Package\RootPackageInterface;
@@ -52,7 +54,9 @@ use Composer\Repository\RootPackageRepository;
 use Composer\Repository\PlatformRepository;
 use Composer\Repository\RepositoryInterface;
 use Composer\Repository\RepositoryManager;
+use Composer\Repository\LockArrayRepository;
 use Composer\Script\ScriptEvents;
+use Composer\Util\Platform;
 
 /**
  * @author Jordi Boggiano <j.boggiano@seld.be>
@@ -132,13 +136,14 @@ class Installer
     protected $writeLock;
     protected $executeOperations = true;
 
+    /** @var bool */
+    protected $updateMirrors = false;
     /**
      * Array of package names/globs flagged for update
      *
      * @var array|null
      */
-    protected $updateMirrors = false;
-    protected $updateAllowList;
+    protected $updateAllowList = null;
     protected $updateAllowTransitiveDependencies = Request::UPDATE_ONLY_LISTED;
 
     /**
@@ -147,7 +152,7 @@ class Installer
     protected $suggestedPackagesReporter;
 
     /**
-     * @var RepositoryInterface
+     * @var ?RepositoryInterface
      */
     protected $additionalFixedRepository;
 
@@ -175,6 +180,7 @@ class Installer
         $this->installationManager = $installationManager;
         $this->eventDispatcher = $eventDispatcher;
         $this->autoloadGenerator = $autoloadGenerator;
+        $this->suggestedPackagesReporter = new SuggestedPackagesReporter($this->io);
 
         $this->writeLock = $config->get('lock');
     }
@@ -202,7 +208,7 @@ class Installer
 
         // Force update if there is no lock file present
         if (!$this->update && !$this->locker->isLocked()) {
-            $this->io->writeError('<warning>No lock file found. Updating dependencies instead of installing from lock file. Use composer update over composer install if you do not have a lock file.</warning>');
+            $this->io->writeError('<warning>No composer.lock file present. Updating dependencies to latest instead of installing from lock file. See https://getcomposer.org/install for more information.</warning>');
             $this->update = true;
         }
 
@@ -220,8 +226,7 @@ class Installer
         }
 
         if ($this->runScripts) {
-            $_SERVER['COMPOSER_DEV_MODE'] = $this->devMode ? '1' : '0';
-            putenv('COMPOSER_DEV_MODE='.$_SERVER['COMPOSER_DEV_MODE']);
+            Platform::putEnv('COMPOSER_DEV_MODE', $this->devMode ? '1' : '0');
 
             // dispatch pre event
             // should we treat this more strictly as running an update and then running an install, triggering events multiple times?
@@ -233,10 +238,6 @@ class Installer
         $this->downloadManager->setPreferDist($this->preferDist);
 
         $localRepo = $this->repositoryManager->getLocalRepository();
-
-        if (!$this->suggestedPackagesReporter) {
-            $this->suggestedPackagesReporter = new SuggestedPackagesReporter($this->io);
-        }
 
         try {
             if ($this->update) {
@@ -298,7 +299,6 @@ class Installer
                 $this->io->writeError('<info>Generating autoload files</info>');
             }
 
-            $this->autoloadGenerator->setDevMode($this->devMode);
             $this->autoloadGenerator->setClassMapAuthoritative($this->classMapAuthoritative);
             $this->autoloadGenerator->setApcu($this->apcuAutoloader, $this->apcuAutoloaderPrefix);
             $this->autoloadGenerator->setRunScripts($this->runScripts);
@@ -365,12 +365,10 @@ class Installer
             // doing a full update
         }
 
-        if ($this->updateAllowList) {
-            if (!$lockedRepository) {
-                $this->io->writeError('<error>Cannot update only a partial set of packages without a lock file present.</error>', true, IOInterface::QUIET);
+        if (($this->updateAllowList || $this->updateMirrors) && !$lockedRepository) {
+            $this->io->writeError('<error>Cannot update ' . ($this->updateMirrors ? 'lock file information' : 'only a partial set of packages') . ' without a lock file present. Run `composer update` to generate a lock file.</error>', true, IOInterface::QUIET);
 
-                return 1;
-            }
+            return 1;
         }
 
         $this->io->writeError('<info>Loading composer repositories with package information</info>');
@@ -387,22 +385,7 @@ class Installer
         }
 
         $request = $this->createRequest($this->fixedRootPackage, $platformRepo, $lockedRepository);
-
-        // if we're updating mirrors we want to keep exactly the same versions installed which are in the lock file, but we want current remote metadata
-        if ($this->updateMirrors && $lockedRepository) {
-            foreach ($lockedRepository->getPackages() as $lockedPackage) {
-                // exclude alias packages here as for root aliases, both alias and aliased are
-                // present in the lock repo and we only want to require the aliased version
-                if (!$lockedPackage instanceof AliasPackage) {
-                    $request->requireName($lockedPackage->getName(), new Constraint('==', $lockedPackage->getVersion()));
-                }
-            }
-        } else {
-            $links = array_merge($this->package->getRequires(), $this->package->getDevRequires());
-            foreach ($links as $link) {
-                $request->requireName($link->getTarget(), $link->getConstraint());
-            }
-        }
+        $this->requirePackagesForUpdate($request, $lockedRepository, true);
 
         // pass the allow list into the request, so the pool builder can apply it
         if ($this->updateAllowList) {
@@ -442,7 +425,7 @@ class Installer
             $this->io->writeError('Nothing to modify in lock file');
         }
 
-        $exitCode = $this->extractDevPackages($lockTransaction, $platformRepo, $aliases, $policy);
+        $exitCode = $this->extractDevPackages($lockTransaction, $platformRepo, $aliases, $policy, $lockedRepository);
         if ($exitCode !== 0) {
             return $exitCode;
         }
@@ -459,6 +442,15 @@ class Installer
                     $installsUpdates[] = $operation;
                     $installNames[] = $operation->getPackage()->getPrettyName().':'.$operation->getPackage()->getFullPrettyVersion();
                 } elseif ($operation instanceof UpdateOperation) {
+                    // when mirrors/metadata from a package gets updated we do not want to list it as an
+                    // update in the output as it is only an internal lock file metadata update
+                    if ($this->updateMirrors
+                        && $operation->getInitialPackage()->getName() == $operation->getTargetPackage()->getName()
+                        && $operation->getInitialPackage()->getVersion() == $operation->getTargetPackage()->getVersion()
+                    ) {
+                        continue;
+                    }
+
                     $installsUpdates[] = $operation;
                     $updateNames[] = $operation->getTargetPackage()->getPrettyName().':'.$operation->getTargetPackage()->getFullPrettyVersion();
                 } elseif ($operation instanceof UninstallOperation) {
@@ -555,7 +547,7 @@ class Installer
      * Run the solver a second time on top of the existing update result with only the current result set in the pool
      * and see what packages would get removed if we only had the non-dev packages in the solver request
      */
-    protected function extractDevPackages(LockTransaction $lockTransaction, $platformRepo, $aliases, $policy)
+    protected function extractDevPackages(LockTransaction $lockTransaction, PlatformRepository $platformRepo, array $aliases, PolicyInterface $policy, LockArrayRepository $lockedRepository = null)
     {
         if (!$this->package->getDevRequires()) {
             return 0;
@@ -572,11 +564,7 @@ class Installer
         $repositorySet->addRepository($resultRepo);
 
         $request = $this->createRequest($this->fixedRootPackage, $platformRepo);
-
-        $links = $this->package->getRequires();
-        foreach ($links as $link) {
-            $request->requireName($link->getTarget(), $link->getConstraint());
-        }
+        $this->requirePackagesForUpdate($request, $lockedRepository, false);
 
         $pool = $repositorySet->createPoolWithAllPackages();
 
@@ -725,7 +713,7 @@ class Installer
         return 0;
     }
 
-    private function createPlatformRepo($forUpdate)
+    protected function createPlatformRepo($forUpdate)
     {
         if ($forUpdate) {
             $platformOverrides = $this->config->get('platform') ?: array();
@@ -785,6 +773,21 @@ class Installer
         $repositorySet->addRepository(new RootPackageRepository($this->fixedRootPackage));
         $repositorySet->addRepository($platformRepo);
         if ($this->additionalFixedRepository) {
+            // allow using installed repos if needed to avoid warnings about installed repositories being used in the RepositorySet
+            // see https://github.com/composer/composer/pull/9574
+            $additionalFixedRepositories = $this->additionalFixedRepository;
+            if ($additionalFixedRepositories instanceof CompositeRepository) {
+                $additionalFixedRepositories = $additionalFixedRepositories->getRepositories();
+            } else {
+                $additionalFixedRepositories = array($additionalFixedRepositories);
+            }
+            foreach ($additionalFixedRepositories as $additionalFixedRepository) {
+                if ($additionalFixedRepository instanceof InstalledRepository || $additionalFixedRepository instanceof InstalledRepositoryInterface) {
+                    $repositorySet->allowInstalledRepositories();
+                    break;
+                }
+            }
+
             $repositorySet->addRepository($this->additionalFixedRepository);
         }
 
@@ -815,12 +818,9 @@ class Installer
     }
 
     /**
-     * @param  RootPackageInterface     $rootPackage
-     * @param  PlatformRepository       $platformRepo
-     * @param  RepositoryInterface|null $lockedRepository
      * @return Request
      */
-    private function createRequest(RootPackageInterface $rootPackage, PlatformRepository $platformRepo, $lockedRepository = null)
+    private function createRequest(RootPackageInterface $rootPackage, PlatformRepository $platformRepo, LockArrayRepository $lockedRepository = null)
     {
         $request = new Request($lockedRepository);
 
@@ -851,6 +851,33 @@ class Installer
         return $request;
     }
 
+    private function requirePackagesForUpdate(Request $request, LockArrayRepository $lockedRepository = null, $includeDevRequires = true)
+    {
+        // if we're updating mirrors we want to keep exactly the same versions installed which are in the lock file, but we want current remote metadata
+        if ($this->updateMirrors) {
+            $excludedPackages = array();
+            if (!$includeDevRequires) {
+                $excludedPackages = array_flip($this->locker->getDevPackageNames());
+            }
+
+            foreach ($lockedRepository->getPackages() as $lockedPackage) {
+                // exclude alias packages here as for root aliases, both alias and aliased are
+                // present in the lock repo and we only want to require the aliased version
+                if (!$lockedPackage instanceof AliasPackage && !isset($excludedPackages[$lockedPackage->getName()])) {
+                    $request->requireName($lockedPackage->getName(), new Constraint('==', $lockedPackage->getVersion()));
+                }
+            }
+        } else {
+            $links = $this->package->getRequires();
+            if ($includeDevRequires) {
+                $links = array_merge($links, $this->package->getDevRequires());
+            }
+            foreach ($links as $link) {
+                $request->requireName($link->getTarget(), $link->getConstraint());
+            }
+        }
+    }
+
     /**
      * @param  bool  $forUpdate
      * @return array
@@ -870,7 +897,7 @@ class Installer
      * @param  array $links
      * @return array
      */
-    private function extractPlatformRequirements($links)
+    private function extractPlatformRequirements(array $links)
     {
         $platformReqs = array();
         foreach ($links as $link) {
@@ -898,7 +925,8 @@ class Installer
         foreach ($packages as $key => $package) {
             if ($package instanceof AliasPackage) {
                 $alias = (string) $package->getAliasOf();
-                $packages[$key] = new AliasPackage($packages[$alias], $package->getVersion(), $package->getPrettyVersion());
+                $className = get_class($package);
+                $packages[$key] = new $className($packages[$alias], $package->getVersion(), $package->getPrettyVersion());
             }
         }
         $rm->setLocalRepository(
@@ -1100,6 +1128,7 @@ class Installer
      *
      * @param  bool      $runScripts
      * @return Installer
+     * @deprecated Use setRunScripts(false) on the EventDispatcher instance being injected instead
      */
     public function setRunScripts($runScripts = true)
     {

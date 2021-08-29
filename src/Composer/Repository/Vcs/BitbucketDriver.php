@@ -33,9 +33,9 @@ abstract class BitbucketDriver extends VcsDriver
     protected $cloneHttpsUrl = '';
 
     /**
-     * @var VcsDriver
+     * @var ?VcsDriver
      */
-    protected $fallbackDriver;
+    protected $fallbackDriver = null;
     /** @var string|null if set either git or hg */
     protected $vcsType;
 
@@ -77,6 +77,7 @@ abstract class BitbucketDriver extends VcsDriver
      * sets some parameters which are used in other methods
      *
      * @return bool
+     * @phpstan-impure
      */
     protected function getRepoData()
     {
@@ -86,7 +87,7 @@ abstract class BitbucketDriver extends VcsDriver
             $this->repository,
             http_build_query(
                 array('fields' => '-project,-owner'),
-                null,
+                '',
                 '&'
             )
         );
@@ -286,7 +287,7 @@ abstract class BitbucketDriver extends VcsDriver
                         'fields' => 'values.name,values.target.hash,next',
                         'sort' => '-target.date',
                     ),
-                    null,
+                    '',
                     '&'
                 )
             );
@@ -330,7 +331,7 @@ abstract class BitbucketDriver extends VcsDriver
                         'fields' => 'values.name,values.target.hash,values.heads,next',
                         'sort' => '-target.date',
                     ),
-                    null,
+                    '',
                     '&'
                 )
             );
@@ -363,6 +364,8 @@ abstract class BitbucketDriver extends VcsDriver
      * @param bool   $fetchingRepoData
      *
      * @return Response The result
+     *
+     * @phpstan-impure
      */
     protected function fetchWithOAuthCredentials($url, $fetchingRepoData = false)
     {
@@ -396,6 +399,9 @@ abstract class BitbucketDriver extends VcsDriver
      */
     abstract protected function generateSshUrl();
 
+    /**
+     * @phpstan-impure
+     */
     protected function attemptCloneFallback()
     {
         try {

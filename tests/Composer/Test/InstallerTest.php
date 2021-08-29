@@ -50,7 +50,7 @@ class InstallerTest extends TestCase
     public function tearDown()
     {
         chdir($this->prevCwd);
-        if (is_dir($this->tempComposerHome)) {
+        if (isset($this->tempComposerHome) && is_dir($this->tempComposerHome)) {
             $fs = new Filesystem;
             $fs->removeDirectory($this->tempComposerHome);
         }
@@ -67,6 +67,21 @@ class InstallerTest extends TestCase
             ->setConstructorArgs(array($io))
             ->getMock();
         $config = $this->getMockBuilder('Composer\Config')->getMock();
+        $config->expects($this->any())
+            ->method('get')
+            ->will($this->returnCallback(function ($key) {
+                switch ($key) {
+                    case 'vendor-dir':
+                        return 'foo';
+                    case 'lock';
+                    case 'notify-on-install';
+                        return true;
+                    case 'platform';
+                        return array();
+                }
+
+                throw new \UnexpectedValueException('Unknown key '.$key);
+            }));
 
         $eventDispatcher = $this->getMockBuilder('Composer\EventDispatcher\EventDispatcher')->disableOriginalConstructor()->getMock();
         $httpDownloader = $this->getMockBuilder('Composer\Util\HttpDownloader')->disableOriginalConstructor()->getMock();
@@ -82,6 +97,7 @@ class InstallerTest extends TestCase
         $installationManager = new InstallationManagerMock();
 
         // emulate a writable lock file
+        /** @var ?string $lockData */
         $lockData = null;
         $lockJsonMock = $this->getMockBuilder('Composer\Json\JsonFile')->disableOriginalConstructor()->getMock();
         $lockJsonMock->expects($this->any())
@@ -378,6 +394,7 @@ class InstallerTest extends TestCase
             $this->assertSame($expectInstalled, $actualInstalled);
         }
 
+        /** @var InstallationManagerMock $installationManager */
         $installationManager = $composer->getInstallationManager();
         $this->assertSame(rtrim($expect), implode("\n", $installationManager->getTrace()));
 
@@ -482,7 +499,7 @@ class InstallerTest extends TestCase
 
     protected function readTestFile(\SplFileInfo $file, $fixturesDir)
     {
-        $tokens = preg_split('#(?:^|\n*)--([A-Z-]+)--\n#', file_get_contents($file->getRealPath()), null, PREG_SPLIT_DELIM_CAPTURE);
+        $tokens = preg_split('#(?:^|\n*)--([A-Z-]+)--\n#', file_get_contents($file->getRealPath()), -1, PREG_SPLIT_DELIM_CAPTURE);
 
         $sectionInfo = array(
             'TEST' => true,

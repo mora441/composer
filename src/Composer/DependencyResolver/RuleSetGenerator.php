@@ -12,7 +12,7 @@
 
 namespace Composer\DependencyResolver;
 
-use Composer\Package\PackageInterface;
+use Composer\Package\BasePackage;
 use Composer\Package\AliasPackage;
 use Composer\Repository\PlatformRepository;
 
@@ -41,15 +41,15 @@ class RuleSetGenerator
      * This rule is of the form (-A|B|C), where B and C are the providers of
      * one requirement of the package A.
      *
-     * @param  PackageInterface $package    The package with a requirement
-     * @param  array            $providers  The providers of the requirement
-     * @param  int              $reason     A RULE_* constant describing the
-     *                                      reason for generating this rule
-     * @param  mixed            $reasonData Any data, e.g. the requirement name,
-     *                                      that goes with the reason
-     * @return Rule|null        The generated rule or null if tautological
+     * @param  BasePackage $package    The package with a requirement
+     * @param  array       $providers  The providers of the requirement
+     * @param  int         $reason     A RULE_* constant describing the
+     *                                 reason for generating this rule
+     * @param  mixed       $reasonData Any data, e.g. the requirement name,
+     *                                 that goes with the reason
+     * @return Rule|null   The generated rule or null if tautological
      */
-    protected function createRequireRule(PackageInterface $package, array $providers, $reason, $reasonData = null)
+    protected function createRequireRule(BasePackage $package, array $providers, $reason, $reasonData = null)
     {
         $literals = array(-$package->id);
 
@@ -70,11 +70,11 @@ class RuleSetGenerator
      * The rule is (A|B|C) with A, B and C different packages. If the given
      * set of packages is empty an impossible rule is generated.
      *
-     * @param  array $packages   The set of packages to choose from
-     * @param  int   $reason     A RULE_* constant describing the reason for
-     *                           generating this rule
-     * @param  array $reasonData Additional data like the root require or fix request info
-     * @return Rule  The generated rule
+     * @param  BasePackage[] $packages   The set of packages to choose from
+     * @param  int           $reason     A RULE_* constant describing the reason for
+     *                                   generating this rule
+     * @param  array         $reasonData Additional data like the root require or fix request info
+     * @return Rule          The generated rule
      */
     protected function createInstallOneOfRule(array $packages, $reason, $reasonData)
     {
@@ -92,15 +92,15 @@ class RuleSetGenerator
      * The rule for conflicting packages A and B is (-A|-B). A is called the issuer
      * and B the provider.
      *
-     * @param  PackageInterface $issuer     The package declaring the conflict
-     * @param  PackageInterface $provider   The package causing the conflict
-     * @param  int              $reason     A RULE_* constant describing the
-     *                                      reason for generating this rule
-     * @param  mixed            $reasonData Any data, e.g. the package name, that
-     *                                      goes with the reason
-     * @return Rule|null        The generated rule
+     * @param  BasePackage $issuer     The package declaring the conflict
+     * @param  BasePackage $provider   The package causing the conflict
+     * @param  int         $reason     A RULE_* constant describing the
+     *                                 reason for generating this rule
+     * @param  mixed       $reasonData Any data, e.g. the package name, that
+     *                                 goes with the reason
+     * @return Rule|null   The generated rule
      */
-    protected function createRule2Literals(PackageInterface $issuer, PackageInterface $provider, $reason, $reasonData = null)
+    protected function createRule2Literals(BasePackage $issuer, BasePackage $provider, $reason, $reasonData = null)
     {
         // ignore self conflict
         if ($issuer === $provider) {
@@ -142,13 +142,13 @@ class RuleSetGenerator
         $this->rules->add($newRule, $type);
     }
 
-    protected function addRulesForPackage(PackageInterface $package, $ignorePlatformReqs)
+    protected function addRulesForPackage(BasePackage $package, $ignorePlatformReqs)
     {
         $workQueue = new \SplQueue;
         $workQueue->enqueue($package);
 
         while (!$workQueue->isEmpty()) {
-            /** @var PackageInterface $package */
+            /** @var BasePackage $package */
             $package = $workQueue->dequeue();
             if (isset($this->addedMap[$package->id])) {
                 continue;
@@ -164,10 +164,8 @@ class RuleSetGenerator
                 $workQueue->enqueue($package->getAliasOf());
                 $this->addRule(RuleSet::TYPE_PACKAGE, $this->createRequireRule($package, array($package->getAliasOf()), Rule::RULE_PACKAGE_ALIAS, $package));
 
-                // root aliases must be installed with their main package, so create a rule the other way around as well
-                if ($package->isRootPackageAlias()) {
-                    $this->addRule(RuleSet::TYPE_PACKAGE, $this->createRequireRule($package->getAliasOf(), array($package), Rule::RULE_PACKAGE_ROOT_ALIAS, $package->getAliasOf()));
-                }
+                // aliases must be installed with their main package, so create a rule the other way around as well
+                $this->addRule(RuleSet::TYPE_PACKAGE, $this->createRequireRule($package->getAliasOf(), array($package), Rule::RULE_PACKAGE_INVERSE_ALIAS, $package->getAliasOf()));
 
                 // if alias package has no self.version requires, its requirements do not
                 // need to be added as the aliased package processing will take care of it
@@ -194,9 +192,10 @@ class RuleSetGenerator
 
     protected function addConflictRules($ignorePlatformReqs = false)
     {
-        /** @var PackageInterface $package */
+        /** @var BasePackage $package */
         foreach ($this->addedMap as $package) {
             foreach ($package->getConflicts() as $link) {
+                // even if conlict ends up being with an alias, there would be at least one actual package by this name
                 if (!isset($this->addedPackagesByNames[$link->getTarget()])) {
                     continue;
                 }
@@ -205,10 +204,14 @@ class RuleSetGenerator
                     continue;
                 }
 
-                /** @var PackageInterface $possibleConflict */
-                foreach ($this->addedPackagesByNames[$link->getTarget()] as $possibleConflict) {
-                    if ($this->pool->match($possibleConflict, $link->getTarget(), $link->getConstraint())) {
-                        $this->addRule(RuleSet::TYPE_PACKAGE, $this->createRule2Literals($package, $possibleConflict, Rule::RULE_PACKAGE_CONFLICT, $link));
+                $conflicts = $this->pool->whatProvides($link->getTarget(), $link->getConstraint());
+
+                foreach ($conflicts as $conflict) {
+                    // define the conflict rule for regular packages, for alias packages it's only needed if the name
+                    // matches the conflict exactly, otherwise the name match is by provide/replace which means the
+                    // package which this is an alias of will conflict anyway, so no need to create additional rules
+                    if (!$conflict instanceof AliasPackage || $conflict->getName() === $link->getTarget()) {
+                        $this->addRule(RuleSet::TYPE_PACKAGE, $this->createRule2Literals($package, $conflict, Rule::RULE_PACKAGE_CONFLICT, $link));
                     }
                 }
             }
@@ -266,9 +269,13 @@ class RuleSetGenerator
     protected function addRulesForRootAliases($ignorePlatformReqs)
     {
         foreach ($this->pool->getPackages() as $package) {
-            // ensure that rules for root alias packages get loaded even if the root alias itself isn't required
-            // otherwise a package could be installed without its root alias which leads to unexpected behavior
-            if ($package instanceof AliasPackage && $package->isRootPackageAlias()) {
+            // ensure that rules for root alias packages and aliases of packages which were loaded are also loaded
+            // even if the alias itself isn't required, otherwise a package could be installed without its alias which
+            // leads to unexpected behavior
+            if (!isset($this->addedMap[$package->id]) &&
+                $package instanceof AliasPackage &&
+                ($package->isRootPackageAlias() || isset($this->addedMap[$package->getAliasOf()->id]))
+            ) {
                 $this->addRulesForPackage($package, $ignorePlatformReqs);
             }
         }

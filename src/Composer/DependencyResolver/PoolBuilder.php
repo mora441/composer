@@ -16,6 +16,9 @@ use Composer\EventDispatcher\EventDispatcher;
 use Composer\IO\IOInterface;
 use Composer\Package\AliasPackage;
 use Composer\Package\BasePackage;
+use Composer\Package\CompleteAliasPackage;
+use Composer\Package\CompletePackage;
+use Composer\Package\CompletePackageInterface;
 use Composer\Package\PackageInterface;
 use Composer\Package\Version\StabilityFilter;
 use Composer\Plugin\PluginEvents;
@@ -36,22 +39,26 @@ class PoolBuilder
 {
     /**
      * @var int[]
+     * @phpstan-var array<string, BasePackage::STABILITY_*>
      */
     private $acceptableStabilities;
     /**
      * @var int[]
+     * @phpstan-var array<string, BasePackage::STABILITY_*>
      */
     private $stabilityFlags;
     /**
-     * @psalm-var array<string, array<string, array{alias: string, alias_normalized: string}>>
+     * @var array[]
+     * @phpstan-var array<string, array<string, array{alias: string, alias_normalized: string}>>
      */
     private $rootAliases;
     /**
-     * @psalm-var array<string, string>
+     * @var string[]
+     * @phpstan-var array<string, string>
      */
     private $rootReferences;
     /**
-     * @var EventDispatcher
+     * @var ?EventDispatcher
      */
     private $eventDispatcher;
     /**
@@ -59,27 +66,32 @@ class PoolBuilder
      */
     private $io;
     /**
-     * @psalm-var array<string, AliasPackage>
+     * @var array[]
+     * @phpstan-var array<string, AliasPackage[]>
      */
     private $aliasMap = array();
     /**
-     * @psalm-var array<string, ConstraintInterface>
+     * @var ConstraintInterface[]
+     * @phpstan-var array<string, ConstraintInterface>
      */
     private $packagesToLoad = array();
     /**
-     * @psalm-var array<string, ConstraintInterface>
+     * @var ConstraintInterface[]
+     * @phpstan-var array<string, ConstraintInterface>
      */
     private $loadedPackages = array();
     /**
-     * @psalm-var array<int, array<string, array<string, PackageInterface>>>
+     * @var array[]
+     * @phpstan-var array<int, array<string, array<string, PackageInterface>>>
      */
     private $loadedPerRepo = array();
     /**
-     * @psalm-var Package[]
+     * @var PackageInterface[]
      */
     private $packages = array();
     /**
-     * @psalm-var list<Package>
+     * @var PackageInterface[]
+     * @phpstan-var list<PackageInterface>
      */
     private $unacceptableFixedOrLockedPackages = array();
     private $updateAllowList = array();
@@ -95,7 +107,8 @@ class PoolBuilder
      */
     private $maxExtendedReqs = array();
     /**
-     * @psalm-var array<string, bool>
+     * @var array
+     * @phpstan-var array<string, bool>
      */
     private $updateAllowWarned = array();
 
@@ -103,13 +116,13 @@ class PoolBuilder
 
     /**
      * @param int[] $acceptableStabilities array of stability => BasePackage::STABILITY_* value
-     * @psalm-param array<string, BasePackage::STABILITY_*> $acceptableStabilities
+     * @phpstan-param array<string, BasePackage::STABILITY_*> $acceptableStabilities
      * @param int[] $stabilityFlags an array of package name => BasePackage::STABILITY_* value
-     * @psalm-param array<string, BasePackage::STABILITY_*> $stabilityFlags
+     * @phpstan-param array<string, BasePackage::STABILITY_*> $stabilityFlags
      * @param array[] $rootAliases
-     * @psalm-param array<string, array<string, array{alias: string, alias_normalized: string}>> $rootAliases
+     * @phpstan-param array<string, array<string, array{alias: string, alias_normalized: string}>> $rootAliases
      * @param string[] $rootReferences an array of package name => source reference
-     * @psalm-param array<string, string> $rootReferences
+     * @phpstan-param array<string, string> $rootReferences
      */
     public function __construct(array $acceptableStabilities, array $stabilityFlags, array $rootAliases, array $rootReferences, IOInterface $io, EventDispatcher $eventDispatcher = null)
     {
@@ -330,7 +343,7 @@ class PoolBuilder
         }
     }
 
-    private function loadPackage(Request $request, PackageInterface $package, $propagateUpdate = true)
+    private function loadPackage(Request $request, BasePackage $package, $propagateUpdate = true)
     {
         $index = $this->indexCounter++;
         $this->packages[$index] = $package;
@@ -360,7 +373,11 @@ class PoolBuilder
             } else {
                 $basePackage = $package;
             }
-            $aliasPackage = new AliasPackage($basePackage, $alias['alias_normalized'], $alias['alias']);
+            if ($basePackage instanceof CompletePackage) {
+                $aliasPackage = new CompleteAliasPackage($basePackage, $alias['alias_normalized'], $alias['alias']);
+            } else {
+                $aliasPackage = new AliasPackage($basePackage, $alias['alias_normalized'], $alias['alias']);
+            }
             $aliasPackage->setRootPackageAlias(true);
 
             $newIndex = $this->indexCounter++;
@@ -372,26 +389,22 @@ class PoolBuilder
             $require = $link->getTarget();
             $linkConstraint = $link->getConstraint();
 
-            if ($propagateUpdate) {
-                // if this is a partial update with transitive dependencies we need to unlock the package we now know is a
+            // if the required package is loaded as a locked package only and hasn't had its deps analyzed
+            if (isset($this->skippedLoad[$require])) {
+                // if we're doing a full update or this is a partial update with transitive deps and we're currently
+                // looking at a package which needs to be updated we need to unlock the package we now know is a
                 // dependency of another package which we are trying to update, and then attempt to load it again
-                if ($request->getUpdateAllowTransitiveDependencies() && isset($this->skippedLoad[$require])) {
+                if ($propagateUpdate && $request->getUpdateAllowTransitiveDependencies()) {
                     if ($request->getUpdateAllowTransitiveRootDependencies() || !$this->isRootRequire($request, $this->skippedLoad[$require])) {
                         $this->unlockPackage($request, $require);
                         $this->markPackageNameForLoading($request, $require, $linkConstraint);
-                    } elseif (!$request->getUpdateAllowTransitiveRootDependencies() && $this->isRootRequire($request, $require) && !isset($this->updateAllowWarned[$require])) {
-                        $this->updateAllowWarned[$require] = true;
-                        $this->io->writeError('<warning>Dependency "'.$require.'" is also a root requirement. Package has not been listed as an update argument, so keeping locked at old version. Use --with-all-dependencies (-W) to include root dependencies.</warning>');
+                    } elseif (!isset($this->updateAllowWarned[$this->skippedLoad[$require]])) {
+                        $this->updateAllowWarned[$this->skippedLoad[$require]] = true;
+                        $this->io->writeError('<warning>Dependency "'.$this->skippedLoad[$require].'" is also a root requirement. Package has not been listed as an update argument, so keeping locked at old version. Use --with-all-dependencies (-W) to include root dependencies.</warning>');
                     }
-                } else {
-                    $this->markPackageNameForLoading($request, $require, $linkConstraint);
                 }
             } else {
-                // We also need to load the requirements of a locked package
-                // unless it was skipped
-                if (!isset($this->skippedLoad[$require])) {
-                    $this->markPackageNameForLoading($request, $require, $linkConstraint);
-                }
+                $this->markPackageNameForLoading($request, $require, $linkConstraint);
             }
         }
 
@@ -431,6 +444,16 @@ class PoolBuilder
      */
     private function isUpdateAllowed(PackageInterface $package)
     {
+        // Path repo packages are never loaded from lock, to force them to always remain in sync
+        // unless symlinking is disabled in which case we probably should rather treat them like
+        // regular packages
+        if ($package->getDistType() === 'path') {
+            $transportOptions = $package->getTransportOptions();
+            if (!isset($transportOptions['symlink']) || $transportOptions['symlink'] !== false) {
+                return true;
+            }
+        }
+
         foreach ($this->updateAllowList as $pattern => $void) {
             $patternRegexp = BasePackage::packageNameToRegexp($pattern);
             if (preg_match($patternRegexp, $package->getName())) {
@@ -471,16 +494,6 @@ class PoolBuilder
      */
     private function unlockPackage(Request $request, $name)
     {
-        // remove locked package by this name which was already initialized
-        foreach ($request->getLockedPackages() as $lockedPackage) {
-            if (!($lockedPackage instanceof AliasPackage) && $lockedPackage->getName() === $name) {
-                if (false !== $index = array_search($lockedPackage, $this->packages, true)) {
-                    $request->unlockPackage($lockedPackage);
-                    $this->removeLoadedPackage($request, $lockedPackage, $index);
-                }
-            }
-        }
-
         if (
             // if we unfixed a replaced package name, we also need to unfix the replacer itself
             $this->skippedLoad[$name] !== $name
@@ -491,6 +504,29 @@ class PoolBuilder
         }
 
         unset($this->skippedLoad[$name], $this->loadedPackages[$name], $this->maxExtendedReqs[$name]);
+
+        // remove locked package by this name which was already initialized
+        foreach ($request->getLockedPackages() as $lockedPackage) {
+            if (!($lockedPackage instanceof AliasPackage) && $lockedPackage->getName() === $name) {
+                if (false !== $index = array_search($lockedPackage, $this->packages, true)) {
+                    $request->unlockPackage($lockedPackage);
+                    $this->removeLoadedPackage($request, $lockedPackage, $index);
+
+                    // make sure that any requirements for this package by other locked or fixed packages are now
+                    // also loaded, as they were previously ignored because the locked (now unlocked) package already
+                    // satisfied their requirements
+                    foreach ($request->getFixedOrLockedPackages() as $fixedOrLockedPackage) {
+                        if ($fixedOrLockedPackage !== $lockedPackage && isset($this->skippedLoad[$fixedOrLockedPackage->getName()])) {
+                            foreach ($fixedOrLockedPackage->getRequires() as $requireLink) {
+                                if ($requireLink->getTarget() === $lockedPackage->getName()) {
+                                    $this->markPackageNameForLoading($request, $lockedPackage->getName(), $requireLink->getConstraint());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private function removeLoadedPackage(Request $request, PackageInterface $package, $index)
